@@ -31,11 +31,11 @@ export default function DecryptTab() {
         canvas.height = img.height
         ctx?.drawImage(img, 0, 0)
 
-        let imageData = ctx?.getImageData(0, 0, canvas.width, canvas.height)
+        const imageData = ctx?.getImageData(0, 0, canvas.width, canvas.height)
         if (!imageData) return
 
         try {
-          const bits = extractBitsFromImage(imageData)
+          const bits = extractWithPRNG(imageData, password)
           const result = await decodeStegoBits(bits, password)
           setMessage(result)
         } catch (err) {
@@ -50,7 +50,7 @@ export default function DecryptTab() {
 
   return (
     <div className="flex flex-col gap-4">
-      <Label>Upload Scrambled Image</Label>
+      <Label>Upload Encrypted Image</Label>
       <Input type="file" accept="image/*" onChange={handleImageChange} />
 
       <Label>Password</Label>
@@ -67,12 +67,16 @@ export default function DecryptTab() {
   )
 }
 
-function extractBitsFromImage(imageData: ImageData): number[] {
-  const bits: number[] = []
+// === Helpers ===
+
+function extractWithPRNG(imageData: ImageData, password: string): number[] {
   const data = imageData.data
-  for (let i = 0; i < data.length; i++) {
-    if ((i + 1) % 4 === 0) continue // skip alpha
-    bits.push(data[i] & 1)
+  const positions = generateShuffledPositions(data.length, password)
+  const bits: number[] = []
+  for (let i = 0; i < positions.length; i++) {
+    const idx = positions[i]
+    if (idx % 4 === 3) continue
+    bits.push(data[idx] & 1)
   }
   return bits
 }
@@ -81,61 +85,56 @@ async function decodeStegoBits(bits: number[], password: string): Promise<string
   const getByte = (start: number) =>
     parseInt(bits.slice(start, start + 8).join(""), 2)
 
-  const header = Array.from({ length: 5 }, (_, i) => String.fromCharCode(getByte(i * 8))).join("")
-  if (header !== "$STEG") throw new Error("Invalid header")
-
-  const lengthBits = bits.slice(5 * 8, 5 * 8 + 16)
-  const msgLen = parseInt(lengthBits.join(""), 2)
-
-  const byteStart = 5 * 8 + 16
-  const byteEnd = byteStart + msgLen * 8
-  const encryptedBytes = new Uint8Array(
-    Array.from({ length: msgLen }, (_, i) =>
-      getByte(byteStart + i * 8)
-    )
+  const lenBits = bits.slice(0, 16)
+  const msgLen = parseInt(lenBits.join(""), 2)
+  const byteStart = 16
+  const encrypted = new Uint8Array(
+    Array.from({ length: msgLen }, (_, i) => getByte(byteStart + i * 8))
   )
 
-  return await decryptMessageAES(encryptedBytes, password)
+  return await decryptMessageAES(encrypted, password)
 }
 
 async function decryptMessageAES(encrypted: Uint8Array, password: string): Promise<string> {
   const salt = encrypted.slice(0, 16)
   const iv = encrypted.slice(16, 28)
   const ciphertext = encrypted.slice(28)
-
   const key = await deriveKey(password, salt)
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    ciphertext
-  )
-
+  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext)
   return new TextDecoder().decode(decrypted)
 }
 
 async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
   const enc = new TextEncoder()
-  const baseKey = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(password),
-    "PBKDF2",
-    false,
-    ["deriveKey"]
-  )
-
+  const baseKey = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"])
   return await crypto.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt,
-      iterations: 100000,
-      hash: "SHA-256"
-    },
+    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
     baseKey,
-    {
-      name: "AES-GCM",
-      length: 256
-    },
+    { name: "AES-GCM", length: 256 },
     false,
-    ["decrypt"]
+    ["encrypt", "decrypt"]
   )
+}
+
+function generateShuffledPositions(length: number, password: string): number[] {
+  const arr = Array.from({ length }, (_, i) => i)
+  const rand = mulberry32(seedFromPassword(password))
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1))
+    ;[arr[i], arr[j]] = [arr[j], arr[i]]
+  }
+  return arr
+}
+
+function mulberry32(seed: number) {
+  return function () {
+    seed |= 0; seed += 0x6D2B79F5
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
+    t ^= t >>> 7; t += Math.imul(t, 61 | t)
+    return ((t ^ t >>> 14) >>> 0) / 4294967296
+  }
+}
+
+function seedFromPassword(pw: string): number {
+  return Array.from(pw).reduce((a, c) => a + c.charCodeAt(0), 0)
 }
