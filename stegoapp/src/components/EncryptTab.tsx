@@ -18,15 +18,15 @@ export default function EncryptTab() {
     }
   }
 
-  const encryptImage = () => {
+  const encryptImage = async () => {
     if (!image || !canvasRef.current) return
     const ctx = canvasRef.current.getContext("2d")
     const img = new Image()
     const reader = new FileReader()
 
-    reader.onload = () => {
+    reader.onload = async () => {
       img.src = reader.result as string
-      img.onload = () => {
+      img.onload = async () => {
         const canvas = canvasRef.current!
         canvas.width = img.width
         canvas.height = img.height
@@ -35,29 +35,26 @@ export default function EncryptTab() {
         let imageData = ctx?.getImageData(0, 0, canvas.width, canvas.height)
         if (!imageData) return
 
-        imageData = encodeMessageInImage(imageData, message)
-        const scrambled = scramblePixels(imageData, password)
+        // Encrypt message and encode
+        const encrypted = await encryptMessageAES(message, password)
+        const binary = buildStegoBinary(encrypted)
+        const encoded = embedBitsInImage(imageData, binary)
 
-        ctx?.putImageData(scrambled, 0, 0)
+        ctx?.putImageData(encoded, 0, 0)
       }
     }
 
     reader.readAsDataURL(image)
   }
 
-const downloadImage = () => {
-  const canvas = canvasRef.current
-  if (!canvas) return
-
-  canvas.toBlob((blob) => {
-    if (!blob) return
+  const downloadImage = () => {
+    const canvas = canvasRef.current
+    if (!canvas) return
     const link = document.createElement("a")
-    link.download = "encrypted.jpg"
-    link.href = URL.createObjectURL(blob)
+    link.download = "encrypted.png"
+    link.href = canvas.toDataURL("image/png")
     link.click()
-    URL.revokeObjectURL(link.href)
-  }, "image/jpeg", 0.7)
-}
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -77,69 +74,77 @@ const downloadImage = () => {
     </div>
   )
 }
-
 // === HELPERS ===
+async function encryptMessageAES(message: string, password: string): Promise<Uint8Array> {
+  const enc = new TextEncoder()
+  const salt = crypto.getRandomValues(new Uint8Array(16))
+  const iv = crypto.getRandomValues(new Uint8Array(12))
 
-function scramblePixels(imageData: ImageData, password: string): ImageData {
-  const { data, width, height } = imageData
-  const shuffled = new Uint8ClampedArray(data)
-  const rand = mulberry32(seedFromPassword(password))
-  const blockSize = 10
+  const key = await deriveKey(password, salt)
+  const cipherText = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    enc.encode(message)
+  )
 
-  for (let y = 0; y < height; y += blockSize) {
-    for (let x = 0; x < width; x += blockSize) {
-      const dx = Math.floor(rand() * width)
-      const dy = Math.floor(rand() * height)
-
-      for (let by = 0; by < blockSize; by++) {
-        for (let bx = 0; bx < blockSize; bx++) {
-          const sx = x + bx
-          const sy = y + by
-          const dx1 = (dx + bx) % width
-          const dy1 = (dy + by) % height
-
-          const srcIdx = (sy * width + sx) * 4
-          const dstIdx = (dy1 * width + dx1) * 4
-
-          for (let i = 0; i < 4; i++) {
-            const temp = shuffled[srcIdx + i]
-            shuffled[srcIdx + i] = shuffled[dstIdx + i]
-            shuffled[dstIdx + i] = temp
-          }
-        }
-      }
-    }
-  }
-
-  return new ImageData(shuffled, width, height)
+  const combined = new Uint8Array(salt.length + iv.length + cipherText.byteLength)
+  combined.set(salt, 0)
+  combined.set(iv, salt.length)
+  combined.set(new Uint8Array(cipherText), salt.length + iv.length)
+  return combined
 }
 
-function encodeMessageInImage(imageData: ImageData, message: string): ImageData {
+async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
+  const enc = new TextEncoder()
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  )
+
+  return await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    {
+      name: "AES-GCM",
+      length: 256
+    },
+    false,
+    ["encrypt", "decrypt"]
+  )
+}
+
+function buildStegoBinary(encrypted: Uint8Array): number[] {
+  const header = "$STEG"
+  const headerBits = [...header].flatMap(c =>
+    c.charCodeAt(0).toString(2).padStart(8, '0').split('').map(Number)
+  )
+
+  const len = encrypted.length
+  const lenBits = len.toString(2).padStart(16, '0').split('').map(Number)
+  const dataBits = [...encrypted].flatMap(b =>
+    b.toString(2).padStart(8, '0').split('').map(Number)
+  )
+
+  return [...headerBits, ...lenBits, ...dataBits]
+}
+
+function embedBitsInImage(imageData: ImageData, bits: number[]): ImageData {
   const data = imageData.data
-  const binaryMessage = (
-    message.split("")
-      .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-      .join("") + "00000000"
-  ).split("").map(bit => parseInt(bit))
+  let bitIndex = 0
 
-  if (binaryMessage.length > data.length) throw new Error("Message too long")
-
-  for (let i = 0; i < binaryMessage.length; i++) {
-    data[i] = (data[i] & 0xFE) | binaryMessage[i]
+  for (let i = 0; i < data.length && bitIndex < bits.length; i++) {
+    if ((i + 1) % 4 === 0) continue // skip alpha
+    data[i] = (data[i] & 0xFE) | bits[bitIndex]
+    bitIndex++
   }
 
   return new ImageData(data, imageData.width, imageData.height)
-}
-
-function mulberry32(seed: number) {
-  return function () {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
-    return ((t ^ t >>> 14) >>> 0) / 4294967296
-  }
-}
-
-function seedFromPassword(pw: string): number {
-  return Array.from(pw).reduce((a, c) => a + c.charCodeAt(0), 0)
 }

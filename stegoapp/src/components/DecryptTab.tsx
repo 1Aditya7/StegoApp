@@ -25,7 +25,7 @@ export default function DecryptTab() {
 
     reader.onload = () => {
       img.src = reader.result as string
-      img.onload = () => {
+      img.onload = async () => {
         const canvas = canvasRef.current!
         canvas.width = img.width
         canvas.height = img.height
@@ -34,11 +34,14 @@ export default function DecryptTab() {
         let imageData = ctx?.getImageData(0, 0, canvas.width, canvas.height)
         if (!imageData) return
 
-        const descrambled = unscramblePixels(imageData, password)
-        ctx?.putImageData(descrambled, 0, 0)
-
-        const hiddenMessage = decodeMessageFromImage(descrambled)
-        setMessage(hiddenMessage)
+        try {
+          const bits = extractBitsFromImage(imageData)
+          const result = await decodeStegoBits(bits, password)
+          setMessage(result)
+        } catch (err) {
+          console.error(err)
+          setMessage("[Failed to decrypt]")
+        }
       }
     }
 
@@ -64,75 +67,75 @@ export default function DecryptTab() {
   )
 }
 
-// === HELPERS ===
-
-function unscramblePixels(imageData: ImageData, password: string): ImageData {
-  const { data, width, height } = imageData
-  const shuffled = new Uint8ClampedArray(data)
-  const rand = mulberry32(seedFromPassword(password))
-  const swaps: [number, number][] = []
-  const blockSize = 10
-
-  for (let y = 0; y < height; y += blockSize) {
-    for (let x = 0; x < width; x += blockSize) {
-      const dx = Math.floor(rand() * width)
-      const dy = Math.floor(rand() * height)
-
-      for (let by = 0; by < blockSize; by++) {
-        for (let bx = 0; bx < blockSize; bx++) {
-          const sx = x + bx
-          const sy = y + by
-          const dx1 = (dx + bx) % width
-          const dy1 = (dy + by) % height
-
-          const srcIdx = (sy * width + sx) * 4
-          const dstIdx = (dy1 * width + dx1) * 4
-          swaps.push([srcIdx, dstIdx])
-        }
-      }
-    }
-  }
-
-  for (let i = swaps.length - 1; i >= 0; i--) {
-    const [a, b] = swaps[i]
-    for (let j = 0; j < 4; j++) {
-      const temp = shuffled[a + j]
-      shuffled[a + j] = shuffled[b + j]
-      shuffled[b + j] = temp
-    }
-  }
-
-  return new ImageData(shuffled, width, height)
-}
-
-function decodeMessageFromImage(imageData: ImageData): string {
+function extractBitsFromImage(imageData: ImageData): number[] {
+  const bits: number[] = []
   const data = imageData.data
-  let bits = []
-
   for (let i = 0; i < data.length; i++) {
+    if ((i + 1) % 4 === 0) continue // skip alpha
     bits.push(data[i] & 1)
   }
-
-  let chars = []
-  for (let i = 0; i < bits.length; i += 8) {
-    const byte = bits.slice(i, i + 8).join("")
-    const charCode = parseInt(byte, 2)
-    if (charCode === 0) break
-    chars.push(String.fromCharCode(charCode))
-  }
-
-  return chars.join("")
+  return bits
 }
 
-function mulberry32(seed: number) {
-  return function () {
-    seed |= 0; seed = seed + 0x6D2B79F5 | 0
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed)
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t
-    return ((t ^ t >>> 14) >>> 0) / 4294967296
-  }
+async function decodeStegoBits(bits: number[], password: string): Promise<string> {
+  const getByte = (start: number) =>
+    parseInt(bits.slice(start, start + 8).join(""), 2)
+
+  const header = Array.from({ length: 5 }, (_, i) => String.fromCharCode(getByte(i * 8))).join("")
+  if (header !== "$STEG") throw new Error("Invalid header")
+
+  const lengthBits = bits.slice(5 * 8, 5 * 8 + 16)
+  const msgLen = parseInt(lengthBits.join(""), 2)
+
+  const byteStart = 5 * 8 + 16
+  const byteEnd = byteStart + msgLen * 8
+  const encryptedBytes = new Uint8Array(
+    Array.from({ length: msgLen }, (_, i) =>
+      getByte(byteStart + i * 8)
+    )
+  )
+
+  return await decryptMessageAES(encryptedBytes, password)
 }
 
-function seedFromPassword(pw: string): number {
-  return Array.from(pw).reduce((a, c) => a + c.charCodeAt(0), 0)
+async function decryptMessageAES(encrypted: Uint8Array, password: string): Promise<string> {
+  const salt = encrypted.slice(0, 16)
+  const iv = encrypted.slice(16, 28)
+  const ciphertext = encrypted.slice(28)
+
+  const key = await deriveKey(password, salt)
+  const decrypted = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv },
+    key,
+    ciphertext
+  )
+
+  return new TextDecoder().decode(decrypted)
+}
+
+async function deriveKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
+  const enc = new TextEncoder()
+  const baseKey = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  )
+
+  return await crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    baseKey,
+    {
+      name: "AES-GCM",
+      length: 256
+    },
+    false,
+    ["decrypt"]
+  )
 }
