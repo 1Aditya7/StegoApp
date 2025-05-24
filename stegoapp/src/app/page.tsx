@@ -21,7 +21,7 @@ export default function Home() {
       {/* Heading */}
       <div className="absolute top-6 w-full flex justify-center z-20">
         <LineShadowText
-          className="text-4xl sm:text-5xl font-bold text-black"
+          className="text-4xl sm:text-5xl font-black text-black italic"
         >
           Stegano.it
         </LineShadowText>
